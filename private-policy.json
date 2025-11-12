@@ -1,0 +1,7 @@
+{
+  "ingress": [
+    { "protocol": "tcp", "port": 22, "action": "deny" },
+    { "protocol": "icmp", "port": -1, "action": "allow" }
+  ]
+}
+

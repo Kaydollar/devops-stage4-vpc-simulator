@@ -1,0 +1,188 @@
+#!/bin/bash
+# ==========================================
+# DevOps Stage 4 — VPC Simulation CLI Tool
+# Author: Yinusa Kolawole (KolaDevOps)
+# ==========================================
+
+set -e
+
+# ========== CONFIG ==========
+VPC_BASE_DIR="/var/run/vpcs"
+mkdir -p "$VPC_BASE_DIR"
+
+INTERNET_INTERFACE="eth0"   # Change if your interface differs (run `ip route` to confirm)
+
+# ========== UTILS ==========
+log() { echo -e "\033[1;34m[INFO]\033[0m $1"; }
+error() { echo -e "\033[1;31m[ERROR]\033[0m $1" >&2; }
+usage() {
+  echo "Usage:
+  vpcctl create <vpc_name> <cidr>
+  vpcctl add-subnet <vpc_name> <subnet_name> <cidr> <type:public|private>
+  vpcctl delete <vpc_name>
+  vpcctl list
+  vpcctl apply-firewall <vpc_name> <subnet_name> <policy.json>
+  vpcctl peer <vpc1> <vpc2>
+  vpcctl unpeer <vpc1> <vpc2>"
+}
+
+# ========== FUNCTIONS ==========
+
+create_vpc() {
+  VPC_NAME=$1
+  CIDR=$2
+  BRIDGE="br-${VPC_NAME}"
+
+  log "Creating VPC '$VPC_NAME' with CIDR $CIDR..."
+  sudo ip link add $BRIDGE type bridge || true
+  sudo ip addr add ${CIDR%.*}.1/16 dev $BRIDGE 2>/dev/null || true
+  sudo ip link set $BRIDGE up
+  mkdir -p "$VPC_BASE_DIR/$VPC_NAME"
+  echo "$CIDR" > "$VPC_BASE_DIR/$VPC_NAME/cidr"
+
+  log "Enabling IP forwarding..."
+  sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  GW1="${CIDR%.*}.1"
+  sudo ip addr add $GW1/16 dev $BRIDGE 2>/dev/null || true
+
+  if ! sudo iptables -t nat -C POSTROUTING -s ${CIDR%.*}.0/16 -o $INTERNET_INTERFACE -j MASQUERADE &>/dev/null; then
+    log "Enabling NAT for ${CIDR%.*}.0/16 via $INTERNET_INTERFACE..."
+    sudo iptables -t nat -A POSTROUTING -s ${CIDR%.*}.0/16 -o $INTERNET_INTERFACE -j MASQUERADE
+  fi
+
+  log "✅ VPC '$VPC_NAME' created with router $BRIDGE"
+}
+
+add_subnet() {
+  VPC_NAME=$1
+  SUBNET=$2
+  CIDR=$3
+  TYPE=$4
+  NS="ns-${VPC_NAME}-${SUBNET}"
+  BRIDGE="br-${VPC_NAME}"
+
+  log "Adding subnet '$SUBNET' to VPC '$VPC_NAME'..."
+
+  if [ "$TYPE" == "public" ]; then
+    log "🔧 Setting up NAT for public subnet..."
+    sudo iptables -t nat -A POSTROUTING -s $CIDR -o $INTERNET_INTERFACE -j MASQUERADE
+    log "✅ NAT enabled for $SUBNET via $INTERNET_INTERFACE"
+  fi
+
+  sudo ip netns add $NS
+  sudo ip link add veth-${SUBNET} type veth peer name veth-${SUBNET}-br
+  sudo ip link set veth-${SUBNET} netns $NS
+  sudo ip link set veth-${SUBNET}-br master $BRIDGE
+  sudo ip link set veth-${SUBNET}-br up
+
+  SUB_IP=$(echo $CIDR | cut -d'/' -f1 | sed 's/0$/2/')
+  GW_IP=$(echo $CIDR | cut -d'/' -f1 | sed 's/0$/1/')
+  sudo ip netns exec $NS ip addr add $SUB_IP/24 dev veth-${SUBNET}
+  sudo ip netns exec $NS ip link set veth-${SUBNET} up
+  sudo ip netns exec $NS ip route add default via $GW_IP
+
+  echo "$CIDR ($TYPE)" >> "$VPC_BASE_DIR/$VPC_NAME/subnets"
+  log "✅ Subnet $SUBNET added with CIDR $CIDR"
+}
+
+delete_vpc() {
+  VPC_NAME=$1
+  log "Deleting VPC '$VPC_NAME'..."
+  for ns in $(sudo ip netns list | grep $VPC_NAME | awk '{print $1}'); do
+    sudo ip netns del $ns
+    log "🧹 Deleted namespace $ns"
+  done
+  sudo ip link del br-${VPC_NAME} type bridge || true
+  rm -rf "$VPC_BASE_DIR/$VPC_NAME"
+  log "✅ VPC $VPC_NAME and all resources deleted."
+}
+
+list_vpcs() {
+  log "Existing VPCs:"
+  ls "$VPC_BASE_DIR" 2>/dev/null || echo "No VPCs found."
+}
+
+apply_firewall() {
+  VPC_NAME=$1
+  SUBNET_NAME=$2
+  POLICY_FILE=$3
+  NS="ns-${VPC_NAME}-${SUBNET_NAME}"
+
+  if ! command -v jq &>/dev/null; then
+    error "jq not found! Install it using: sudo apt install jq -y"
+    exit 1
+  fi
+
+  log "Applying firewall rules from $POLICY_FILE to $NS..."
+  RULES=$(jq -c '.ingress[]' $POLICY_FILE)
+
+  for rule in $RULES; do
+    PROTO=$(echo $rule | jq -r '.protocol')
+    PORT=$(echo $rule | jq -r '.port')
+    ACTION=$(echo $rule | jq -r '.action')
+
+    # Convert action to iptables target
+    if [ "$ACTION" = "allow" ]; then
+      TARGET="ACCEPT"
+    else
+      TARGET="DROP"
+    fi
+
+    if [ "$PROTO" = "icmp" ]; then
+      sudo ip netns exec $NS iptables -A INPUT -p icmp -j $TARGET
+      log "➡️ Rule: $ACTION icmp"
+    elif [ "$PORT" = "-1" ]; then
+      sudo ip netns exec $NS iptables -A INPUT -p $PROTO -j $TARGET
+      log "➡️ Rule: $ACTION $PROTO (all ports)"
+    else
+      sudo ip netns exec $NS iptables -A INPUT -p $PROTO --dport $PORT -j $TARGET 2>/dev/null || \
+      sudo ip netns exec $NS iptables -A INPUT -p $PROTO -j $TARGET
+      log "➡️ Rule: $ACTION $PROTO port $PORT"
+    fi
+  done
+
+  log "✅ Firewall rules applied."
+}
+
+peer_vpcs() {
+  VPC1=$1
+  VPC2=$2
+  BR1="br-${VPC1}"
+  BR2="br-${VPC2}"
+
+  log "🔗 Creating peering between $VPC1 and $VPC2..."
+
+  sudo ip link add veth-${VPC1}-${VPC2} type veth peer name veth-${VPC2}-${VPC1}
+  sudo ip link set veth-${VPC1}-${VPC2} master $BR1
+  sudo ip link set veth-${VPC2}-${VPC1} master $BR2
+  sudo ip link set veth-${VPC1}-${VPC2} up
+  sudo ip link set veth-${VPC2}-${VPC1} up
+
+  log "✅ VPCs $VPC1 and $VPC2 are now peered and routable."
+}
+
+unpeer_vpcs() {
+  VPC1=$1
+  VPC2=$2
+  log "🚫 Removing peering between $VPC1 and $VPC2..."
+  sudo ip link del veth-${VPC1}-${VPC2} 2>/dev/null || true
+  sudo ip link del veth-${VPC2}-${VPC1} 2>/dev/null || true
+  log "✅ Peering removed."
+}
+
+# ========== MAIN DISPATCHER ==========
+CMD=$1
+shift || true
+
+case "$CMD" in
+  create) create_vpc "$@" ;;
+  add-subnet) add_subnet "$@" ;;
+  delete) delete_vpc "$@" ;;
+  list) list_vpcs ;;
+  apply-firewall) apply_firewall "$@" ;;
+  peer) peer_vpcs "$@" ;;
+  unpeer) unpeer_vpcs "$@" ;;
+  *) usage ;;
+esac
+
